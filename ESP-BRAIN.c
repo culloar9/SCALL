@@ -1,9 +1,11 @@
+//pio run -t erase
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
+#include <time.h>
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "driver/adc.h"
 #include "driver/gpio.h"
 #include "esp_adc_cal.h"
@@ -12,47 +14,109 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include <inttypes.h>
+#include "nvs.h"
 #include "esp_http_server.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "mqtt_client.h"
+#include "certificates.h"
 #include "esp_now.h"
 
-#define sensorTurbidez ADC1_CHANNEL_6 // GPIO34
-#define sensorLluvia ADC1_CHANNEL_7   // GPIO35
+
+
+// Pines
+#define sensorTurbidez ADC1_CHANNEL_6
+#define sensorLluvia ADC1_CHANNEL_7
 #define pinFlujo GPIO_NUM_26
 #define pinRelay GPIO_NUM_27
 #define voltajeRef 1100
 #define numMuestras 800
-#define WIFI_SSID       "Totalplay-2.4G-6740"
-#define WIFI_PASS       "35cxHEMt7MTmG9Dh"
+#define WIFI_CHANNEL 2 //ESP NOW 
+
+// Variables globales
+static const char *TAG = "SCALL-ESP32";
 
 volatile uint32_t contadorPulsos = 0;
 uint64_t totalPulsos = 0;
+float valorNTU, voltaje, humedad, flujo, litros;
 
-static const char *TAG = "ESP32";
+bool wifiConfigurado = false;
+bool wifiConectado = false;
+bool mqttConectado = false;
 
-float valorNTU = 0;
-float voltaje = 0;
-float humedad = 0;
-float flujo = 0;
-float litros = 0;
+char device_id[20] = {0};
 
-// 🔹 Variables del sensor ultrasónico recibido
+//ESP NOW 
 typedef struct {
     float distancia;
     float nivel;
     float llenado;
 } NivelData;
 
-static NivelData nivelAgua = {0};
+NivelData nivelAgua = {0};
 
-// ────────────────────────────────
-// FUNCIONES EXISTENTES
-// ────────────────────────────────
+// Callback de recepción
+static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) {
+    if (len == sizeof(NivelData)) {
+        memcpy(&nivelAgua, data, sizeof(NivelData));
+        ESP_LOGI("ESP-NOW", "Datos recibidos -> Distancia: %.2f cm | Nivel: %.2f cm | Llenado: %.1f%%",
+                 nivelAgua.distancia, nivelAgua.nivel, nivelAgua.llenado);
+    }
+}
 
-float redondear(float valor, int decimales)
+// Inicialización ESP-NOW (CORREGIDA - SIN cambio de modo WiFi)
+void iniciarESPNOW(void)
 {
-    float factor = powf(10.0f, decimales);
-    return roundf(valor * factor) / factor;
+    //Usa el canal actual del Wi-Fi (sin forzarlo)
+    uint8_t primary;
+    wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary, &second);
+
+    ESP_ERROR_CHECK(esp_now_init());
+    esp_now_register_recv_cb(on_data_recv);
+
+    ESP_LOGI("ESP-NOW", "✓ Receptor ESP-NOW inicializado en canal %d (mismo que Wi-Fi)", primary);
+}
+
+
+// MQTT
+esp_mqtt_client_handle_t mqtt_client = NULL;
+char mqtt_topic_data[100] = {0};
+char mqtt_topic_command[100] = {0};
+char mqtt_uri[256] = {0};
+
+// Variables para detectar cambios
+float prevNTU, prevVoltaje, prevHumedad, prevFlujo, prevLitros;
+bool primeraLectura = true;
+uint64_t ultimaPublicacion = 0;
+
+// Umbrales de cambio (al mínimo cambio)
+#define UMBRAL_NTU 0.01f
+#define UMBRAL_VOLTAJE 0.01f
+#define UMBRAL_HUMEDAD 0.1f
+#define UMBRAL_FLUJO 0.01f
+#define UMBRAL_LITROS 0.01f
+#define TIEMPO_HEARTBEAT 60000 // 60s
+
+// BLE
+#define GATTS_SERVICE_UUID 0x00FF
+#define GATTS_CHAR_UUID 0xFF01
+#define GATTS_NUM_HANDLE 4
+
+static uint16_t conexion_id = 0;
+static uint16_t gatts_if_almacenado = 0;
+
+char ssid_recibido[32] = {0};
+char password_recibido[64] = {0};
+bool credenciales_recibidas = false;
+
+// Utilidades
+float redondear(float v, int d)
+{
+    float f = powf(10.0f, d);
+    return roundf(v * f) / f;
 }
 
 float calcularNTU(float v)
@@ -70,18 +134,250 @@ static void IRAM_ATTR interrupcionFlujo(void *arg)
     contadorPulsos++;
 }
 
-// 🔹 Manejador de datos HTTP modificado para incluir el nivel de agua
+// Generar Device ID único basado en MAC
+void generarDeviceID(void)
+{
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(device_id, sizeof(device_id), "ESP32_%02X%02X%02X",
+             mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "✓ Device ID generado: %s", device_id);
+}
+
+// NVS
+void guardarCredencialesWiFi(const char *ssid, const char *password)
+{
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) == ESP_OK)
+    {
+        nvs_set_str(h, "wifi_ssid", ssid);
+        nvs_set_str(h, "wifi_pass", password);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Credenciales WiFi guardadas");
+    }
+}
+
+bool cargarCredencialesWiFi(char *ssid, char *password)
+{
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READONLY, &h) != ESP_OK)
+        return false;
+
+    size_t s_len = 32, p_len = 64;
+    esp_err_t e1 = nvs_get_str(h, "wifi_ssid", ssid, &s_len);
+    esp_err_t e2 = nvs_get_str(h, "wifi_pass", password, &p_len);
+    nvs_close(h);
+    return (e1 == ESP_OK && e2 == ESP_OK);
+}
+
+// Detectar si hay cambios significativos
+bool hayaCambiosSignificativos(void)
+{
+    // Primera lectura: siempre publicar
+    if (primeraLectura)
+    {
+        ESP_LOGI(TAG, "-------------------Primera lectura - publicando");
+        primeraLectura = false;
+        return true;
+    }
+
+    bool cambio = false;
+
+    if (fabs(valorNTU - prevNTU) > UMBRAL_NTU)
+    {
+        ESP_LOGI(TAG, "△ NTU: %.2f → %.2f", prevNTU, valorNTU);
+        cambio = true;
+    }
+
+    if (fabs(voltaje - prevVoltaje) > UMBRAL_VOLTAJE)
+    {
+        ESP_LOGI(TAG, "△ Voltaje: %.2f → %.2f", prevVoltaje, voltaje);
+        cambio = true;
+    }
+
+    if (fabs(humedad - prevHumedad) > UMBRAL_HUMEDAD)
+    {
+        ESP_LOGI(TAG, "△ Humedad: %.1f → %.1f", prevHumedad, humedad);
+        cambio = true;
+    }
+
+    if (fabs(flujo - prevFlujo) > UMBRAL_FLUJO)
+    {
+        ESP_LOGI(TAG, "△ Flujo: %.2f → %.2f", prevFlujo, flujo);
+        cambio = true;
+    }
+
+    if (fabs(litros - prevLitros) > UMBRAL_LITROS)
+    {
+        ESP_LOGI(TAG, "△ Litros: %.2f → %.2f", prevLitros, litros);
+        cambio = true;
+    }
+
+    // Heartbeat: garantizar publicación cada 60s
+    uint64_t ahora = esp_timer_get_time() / 1000;
+    if ((ahora - ultimaPublicacion) > TIEMPO_HEARTBEAT)
+    {
+        ESP_LOGI(TAG, "-----------------------Heartbeat (60s)");
+        cambio = true;
+    }
+
+    return cambio;
+}
+
+// MQTT - Publicar datos a AWS IoT
+void publicarDatosAWS(void)
+{
+    if (!mqttConectado)
+    {
+        ESP_LOGW(TAG, "MQTT no conectado, omitiendo publicación");
+        return;
+    }
+
+    time_t now = time(NULL);
+    int relay_estado = gpio_get_level(pinRelay);
+
+    char payload[500];  // ← AUMENTAR tamaño para más datos
+    snprintf(payload, sizeof(payload),
+             "{"
+             "\"device_id\":\"%s\","
+             "\"timestamp\":%ld,"
+             "\"ntu\":%.2f,"
+             "\"voltaje\":%.2f,"
+             "\"humedad\":%.1f,"
+             "\"flujo\":%.2f,"
+             "\"litros\":%.2f,"
+             "\"relay\":\"%s\","
+             "\"distancia\":%.2f,"      // ← NUEVO
+             "\"nivel\":%.2f,"          // ← NUEVO
+             "\"llenado\":%.1f"         // ← NUEVO
+             "}",
+             device_id, (long)now, valorNTU, voltaje, humedad, flujo, litros,
+             relay_estado ? "on" : "off",
+             nivelAgua.distancia,      // ← NUEVO
+             nivelAgua.nivel,          // ← NUEVO
+             nivelAgua.llenado);       // ← NUEVO
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_data, payload, 0, 1, 0);
+    if (msg_id > 0)
+    {
+        ESP_LOGI(TAG, "✓ Datos publicados a AWS IoT, msg_id=%d", msg_id);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "✗ Error al publicar datos");
+    }
+}
+
+// MQTT - Callback de eventos
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    switch (event->event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "✓ MQTT Conectado a AWS IoT Core");
+        mqttConectado = true;
+        int msg_id = esp_mqtt_client_subscribe(mqtt_client, mqtt_topic_command, 1);
+        ESP_LOGI(TAG, "Suscrito a: %s, msg_id=%d", mqtt_topic_command, msg_id);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "✗ MQTT Desconectado");
+        mqttConectado = false;
+        break;
+
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "=== MQTT Mensaje recibido ===");
+        ESP_LOGI(TAG, "Topic: %.*s", event->topic_len, event->topic);
+        ESP_LOGI(TAG, "Data: %.*s", event->data_len, event->data);
+
+        if (strncmp(event->data, "{\"action\":\"relay_on\"}", event->data_len) == 0)
+        {
+            gpio_set_level(pinRelay, 1);
+            ESP_LOGI(TAG, "✓ Relay encendido por comando remoto");
+        }
+        else if (strncmp(event->data, "{\"action\":\"relay_off\"}", event->data_len) == 0)
+        {
+            gpio_set_level(pinRelay, 0);
+            ESP_LOGI(TAG, "✓ Relay apagado por comando remoto");
+        }
+        else if (strncmp(event->data, "{\"action\":\"relay_toggle\"}", event->data_len) == 0)
+        {
+            int estado_actual = gpio_get_level(pinRelay);
+            gpio_set_level(pinRelay, !estado_actual);
+            ESP_LOGI(TAG, "✓ Relay toggle: %s", !estado_actual ? "ON" : "OFF");
+        }
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
+        break;
+
+    default:
+        break;
+    }
+}
+
+// MQTT - Inicializar conexión a AWS IoT
+void iniciarMQTT(void)
+{
+    ESP_LOGI(TAG, "Iniciando conexión MQTT a AWS IoT...");
+
+    snprintf(mqtt_topic_data, sizeof(mqtt_topic_data), "device/%s/data", device_id);
+    snprintf(mqtt_topic_command, sizeof(mqtt_topic_command), "device/%s/command", device_id);
+
+    ESP_LOGI(TAG, "Topic datos: %s", mqtt_topic_data);
+    ESP_LOGI(TAG, "Topic comandos: %s", mqtt_topic_command);
+
+    strncpy(mqtt_uri, aws_iot_endpoint, sizeof(mqtt_uri) - 1);
+    mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker = {
+            .address = {
+                .hostname = mqtt_uri,
+                .transport = MQTT_TRANSPORT_OVER_SSL,
+                .port = 8883,
+            },
+            .verification = {
+                .certificate = root_ca,
+            },
+        },
+        .credentials = {
+            .authentication = {
+                .certificate = device_cert,
+                .key = private_key,
+            },
+            .client_id = device_id,
+        },
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (mqtt_client == NULL)
+    {
+        ESP_LOGE(TAG, "✗ Error al inicializar cliente MQTT");
+        return;
+    }
+
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+
+    ESP_LOGI(TAG, "✓ Cliente MQTT iniciado");
+}
+
+// HTTP
 static esp_err_t manejadorDatos(httpd_req_t *req)
 {
-    char respuesta[300];
-    snprintf(respuesta, sizeof(respuesta),
+    char res[200];
+    snprintf(res, sizeof(res),
              "{\"ntu\":%.2f,\"voltaje\":%.2f,\"humedad\":%.2f,"
-             "\"flujo\":%.2f,\"litros\":%.2f,"
-             "\"distancia\":%.2f,\"nivel\":%.2f,\"llenado\":%.1f}",
-             valorNTU, voltaje, humedad, flujo, litros,
-             nivelAgua.distancia, nivelAgua.nivel, nivelAgua.llenado);
+             "\"flujo\":%.2f,\"litros\":%.2f}",
+             valorNTU, voltaje, humedad, flujo, litros);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, respuesta, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, res, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -94,39 +390,35 @@ static esp_err_t manejadorRelay(httpd_req_t *req)
         if (strncmp(buf, "on", 2) == 0)
         {
             gpio_set_level(pinRelay, 1);
-            ESP_LOGI(TAG, "Relay encendido");
+            ESP_LOGI(TAG, "✓ Relay encendido (HTTP)");
         }
         else if (strncmp(buf, "off", 3) == 0)
         {
             gpio_set_level(pinRelay, 0);
-            ESP_LOGI(TAG, "Relay apagado");
+            ESP_LOGI(TAG, "✓ Relay apagado (HTTP)");
         }
     }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 httpd_handle_t iniciarServidorWeb(void)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t servidor = NULL;
-    if (httpd_start(&servidor, &config) == ESP_OK)
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t srv = NULL;
+    if (httpd_start(&srv, &cfg) == ESP_OK)
     {
-        httpd_uri_t uriGet = {
-            .uri = "/datos",
-            .method = HTTP_GET,
-            .handler = manejadorDatos};
-        httpd_register_uri_handler(servidor, &uriGet);
-
-        httpd_uri_t uriPost = {
-            .uri = "/relay",
-            .method = HTTP_POST,
-            .handler = manejadorRelay};
-        httpd_register_uri_handler(servidor, &uriPost);
+        httpd_uri_t u1 = {.uri = "/datos", .method = HTTP_GET, .handler = manejadorDatos};
+        httpd_uri_t u2 = {.uri = "/relay", .method = HTTP_POST, .handler = manejadorRelay};
+        httpd_register_uri_handler(srv, &u1);
+        httpd_register_uri_handler(srv, &u2);
+        ESP_LOGI(TAG, "✓ Servidor HTTP iniciado");
     }
-    return servidor;
+    return srv;
 }
 
+// WiFi
 static void eventoWiFi(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
@@ -135,135 +427,355 @@ static void eventoWiFi(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
     else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        ESP_LOGW("WIFI", "Desconectado. Reintentando...");
+        wifiConectado = false;
+        mqttConectado = false;
+        ESP_LOGW(TAG, "WiFi desconectado, reintentando...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
         esp_wifi_connect();
     }
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
-        ip_event_got_ip_t *evento = (ip_event_got_ip_t *)data;
-        ESP_LOGI("WIFI", "IP obtenida: " IPSTR, IP2STR(&evento->ip_info.ip));
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "✓ WiFi conectado! IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        wifiConectado = true;
+
+        iniciarServidorWeb();
+        iniciarMQTT();
     }
 }
 
-void configurarWiFi(void)
+void configurarWiFi(const char *ssid, const char *password)
 {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
+    if (!wifiConfigurado)
+    {
+        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &eventoWiFi, NULL);
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &eventoWiFi, NULL);
+        wifiConfigurado = true;
+    }
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    wifi_config_t conf = {0};
+    strncpy((char *)conf.sta.ssid, ssid, sizeof(conf.sta.ssid) - 1);
+    strncpy((char *)conf.sta.password, password, sizeof(conf.sta.password) - 1);
 
-    wifi_config_t configWiFi = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS}};
-
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &eventoWiFi, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &eventoWiFi, NULL);
-
+    ESP_LOGI(TAG, "Conectando a WiFi: %s", ssid);
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(ESP_IF_WIFI_STA, &configWiFi);
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &conf);
     esp_wifi_start();
 }
 
-// ────────────────────────────────
-// 🔹 NUEVO: Funciones ESP-NOW receptor
-// ────────────────────────────────
-
-static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len)
+// BLE
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
-    if (len == sizeof(NivelData))
+    switch (event)
     {
-        memcpy(&nivelAgua, data, sizeof(NivelData));
-        ESP_LOGI(TAG, "Datos recibidos ESP-NOW -> Distancia: %.2f cm | Nivel: %.2f cm | Llenado: %.1f%%",
-                 nivelAgua.distancia, nivelAgua.nivel, nivelAgua.llenado);
+    case ESP_GATTS_REG_EVT:
+    {
+        ESP_LOGI(TAG, "BLE GATT Server registrado");
+        gatts_if_almacenado = gatts_if;
+        esp_ble_gap_set_device_name("SCALL-ESP32");
+
+        esp_ble_adv_data_t adv_data = {
+            .set_scan_rsp = false,
+            .include_name = true,
+            .include_txpower = true,
+            .min_interval = 0x20,
+            .max_interval = 0x40,
+            .appearance = 0x00,
+            .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT)};
+
+        static esp_ble_adv_params_t adv_params = {
+            .adv_int_min = 0x20,
+            .adv_int_max = 0x40,
+            .adv_type = ADV_TYPE_IND,
+            .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+            .channel_map = ADV_CHNL_ALL,
+            .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY};
+
+        esp_ble_gap_config_adv_data(&adv_data);
+        esp_ble_gap_start_advertising(&adv_params);
+
+        esp_gatt_srvc_id_t sid = {
+            .is_primary = true,
+            .id.inst_id = 0,
+            .id.uuid.len = ESP_UUID_LEN_16,
+            .id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID};
+        esp_ble_gatts_create_service(gatts_if, &sid, GATTS_NUM_HANDLE);
+        break;
     }
-    else
+
+    case ESP_GATTS_CREATE_EVT:
     {
-        ESP_LOGW(TAG, "Tamaño inesperado de datos ESP-NOW: %d bytes", len);
+        ESP_LOGI(TAG, "Servicio BLE creado");
+        esp_ble_gatts_start_service(param->create.service_handle);
+
+        esp_bt_uuid_t uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = GATTS_CHAR_UUID};
+        esp_gatt_char_prop_t prop = ESP_GATT_CHAR_PROP_BIT_READ |
+                                    ESP_GATT_CHAR_PROP_BIT_WRITE |
+                                    ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+
+        esp_ble_gatts_add_char(param->create.service_handle, &uuid,
+                               ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                               prop, NULL, NULL);
+        break;
+    }
+
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(TAG, "Cliente BLE conectado");
+        conexion_id = param->connect.conn_id;
+        break;
+
+    case ESP_GATTS_DISCONNECT_EVT:
+    {
+        ESP_LOGI(TAG, "Cliente BLE desconectado");
+        conexion_id = 0;
+
+        static esp_ble_adv_params_t adv_params = {
+            .adv_int_min = 0x20,
+            .adv_int_max = 0x40,
+            .adv_type = ADV_TYPE_IND,
+            .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+            .channel_map = ADV_CHNL_ALL,
+            .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY};
+        esp_ble_gap_start_advertising(&adv_params);
+        break;
+    }
+
+    case ESP_GATTS_WRITE_EVT:
+    {
+        if (!param || !param->write.value || param->write.len <= 0)
+        {
+            ESP_LOGW(TAG, "WRITE vacío o inválido");
+            break;
+        }
+
+        ESP_LOGI(TAG, "=== Datos recibidos por BLE ===");
+        ESP_LOGI(TAG, "Longitud: %d bytes", param->write.len);
+
+        if (param->write.need_rsp)
+        {
+            esp_gatt_rsp_t rsp = {0};
+            rsp.attr_value.handle = param->write.handle;
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                        param->write.trans_id, ESP_GATT_OK, &rsp);
+            ESP_LOGI(TAG, "Respuesta BLE enviada");
+        }
+
+        char datos[128] = {0};
+        int len_copiar = (param->write.len < sizeof(datos) - 1) ? param->write.len : sizeof(datos) - 1;
+        memcpy(datos, param->write.value, len_copiar);
+        datos[len_copiar] = '\0';
+
+        ESP_LOGI(TAG, "Datos completos: '%s'", datos);
+
+        char *separador = strchr(datos, ':');
+        if (separador != NULL)
+        {
+            *separador = '\0';
+            strncpy(ssid_recibido, datos, sizeof(ssid_recibido) - 1);
+            strncpy(password_recibido, separador + 1, sizeof(password_recibido) - 1);
+
+            ESP_LOGI(TAG, "✓ Credenciales WiFi recibidas:");
+            ESP_LOGI(TAG, "  SSID: '%s'", ssid_recibido);
+            ESP_LOGI(TAG, "  PASS: '%s'", password_recibido);
+
+            credenciales_recibidas = true;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "✗ Formato inválido. Esperaba SSID:PASSWORD");
+        }
+
+        ESP_LOGI(TAG, "===============================");
+        break;
+    }
+
+    case ESP_GATTS_READ_EVT:
+    {
+        ESP_LOGI(TAG, "=== Cliente BLE solicita lectura ===");
+
+        esp_gatt_rsp_t rsp;
+        memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len = strlen(device_id);
+        memcpy(rsp.attr_value.value, device_id, rsp.attr_value.len);
+
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                    param->read.trans_id, ESP_GATT_OK, &rsp);
+
+        ESP_LOGI(TAG, "✓ Device ID enviado: %s", device_id);
+        ESP_LOGI(TAG, "===================================");
+        break;
+    }
+
+    default:
+        break;
     }
 }
 
-static void iniciarESPNOW(void)
+void iniciarBLE(void)
 {
-    if (esp_now_init() != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Error iniciando ESP-NOW");
-        return;
-    }
-    esp_now_register_recv_cb(on_data_recv);
-    ESP_LOGI(TAG, "ESP-NOW receptor inicializado correctamente");
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_bt_controller_init(&cfg);
+    esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    esp_bluedroid_init();
+    esp_bluedroid_enable();
+    esp_ble_gatts_register_callback(gatts_event_handler);
+    esp_ble_gap_register_callback(NULL);
+    esp_ble_gatts_app_register(0);
+    ESP_LOGI(TAG, "✓ Servidor BLE iniciado: SCALL-ESP32");
 }
 
-// ────────────────────────────────
-// MAIN
-// ────────────────────────────────
+void procesar_credenciales_task(void *pv)
+{
+    while (1)
+    {
+        if (credenciales_recibidas)
+        {
+            credenciales_recibidas = false;
+            ESP_LOGI(TAG, "Procesando credenciales WiFi...");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            guardarCredencialesWiFi(ssid_recibido, password_recibido);
+            configurarWiFi(ssid_recibido, password_recibido);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void tarea_publicacion_aws(void *pv)
+{
+    while (1)
+    {
+        // Revisar cada 2 segundos
+        vTaskDelay(pdMS_TO_TICKS(2000));
+
+        if (wifiConectado && mqttConectado)
+        {
+            // Solo publicar si hay cambios
+            if (hayaCambiosSignificativos())
+            {
+                publicarDatosAWS();
+
+                // Actualizar valores previos
+                prevNTU = valorNTU;
+                prevVoltaje = voltaje;
+                prevHumedad = humedad;
+                prevFlujo = flujo;
+                prevLitros = litros;
+                ultimaPublicacion = esp_timer_get_time() / 1000;
+            }
+        }
+    }
+}
 
 void app_main(void)
 {
-    nvs_flash_init();
-    configurarWiFi();
-    iniciarESPNOW();      // 🔥 NUEVO: inicializa receptor ESP-NOW
-    iniciarServidorWeb();
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_LOGI(TAG, "=============================");
+    ESP_LOGI(TAG, "   SCALL ESP32 - Iniciando");
+    ESP_LOGI(TAG, "=============================");
+
+    iniciarBLE();
+
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_cfg);
+
+    generarDeviceID();
+
+    char ssid[32] = {0}, pass[64] = {0};
+    if (cargarCredencialesWiFi(ssid, pass))
+    {
+        ESP_LOGI(TAG, "Credenciales guardadas encontradas");
+        configurarWiFi(ssid, pass);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Esperando configuración BLE...");
+    }
+    
+    iniciarESPNOW(); 
 
     adc1_config_width(ADC_WIDTH_BIT_12);
     adc1_config_channel_atten(sensorTurbidez, ADC_ATTEN_DB_12);
     adc1_config_channel_atten(sensorLluvia, ADC_ATTEN_DB_12);
 
-    esp_adc_cal_characteristics_t caracteristicas;
-    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, voltajeRef, &caracteristicas);
+    esp_adc_cal_characteristics_t ch;
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, voltajeRef, &ch);
 
-    gpio_config_t configGPIO = {
+    gpio_config_t cfg = {
         .intr_type = GPIO_INTR_POSEDGE,
         .mode = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << pinFlujo),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_ENABLE};
-    gpio_config(&configGPIO);
+        .pull_down_en = 0,
+        .pull_up_en = 1};
+    gpio_config(&cfg);
     gpio_install_isr_service(0);
     gpio_isr_handler_add(pinFlujo, interrupcionFlujo, NULL);
 
+    // ✅ CONFIGURAR RELAY AL FINAL (después de WiFi, ESP-NOW y sensores)
     gpio_reset_pin(pinRelay);
     gpio_set_direction(pinRelay, GPIO_MODE_OUTPUT);
     gpio_set_level(pinRelay, 0); // Apagado por defecto
+    ESP_LOGI(TAG, "✓ Relay configurado (APAGADO)");
+
+    ESP_LOGI(TAG, "✓ Sensores configurados");
+    ESP_LOGI(TAG, "=============================");
+
+    xTaskCreate(procesar_credenciales_task, "wifi_task", 4096, NULL, 5, NULL);
+    xTaskCreate(tarea_publicacion_aws, "aws_publish_task", 8192, NULL, 5, NULL);
 
     while (1)
     {
-        contadorPulsos = 0;
-        int64_t tiempoInicio = esp_timer_get_time();
         vTaskDelay(pdMS_TO_TICKS(2000));
-        int64_t tiempoFin = esp_timer_get_time();
-        float duracion = (tiempoFin - tiempoInicio) / 1000000.0f;
+
+        if (!wifiConectado)
+        {
+            ESP_LOGI(TAG, "Esperando conexión WiFi...");
+            continue;
+        }
+
+        contadorPulsos = 0;
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
         totalPulsos += contadorPulsos;
         flujo = contadorPulsos / 7.5f;
         litros = totalPulsos / 450.0f;
 
-        uint32_t sumaTurbidez = 0;
+        uint32_t sumaT = 0;
         for (int i = 0; i < numMuestras; i++)
-            sumaTurbidez += adc1_get_raw(sensorTurbidez);
-        uint32_t promedioTurbidez = sumaTurbidez / numMuestras;
-        uint32_t voltajeMV = esp_adc_cal_raw_to_voltage(promedioTurbidez, &caracteristicas);
-        voltaje = redondear(voltajeMV / 1000.0f, 2);
+            sumaT += adc1_get_raw(sensorTurbidez);
+        uint32_t promT = sumaT / numMuestras;
+        uint32_t voltT = esp_adc_cal_raw_to_voltage(promT, &ch);
+        voltaje = redondear(voltT / 1000.0f, 2);
         valorNTU = calcularNTU(voltaje);
 
-        uint32_t sumaLluvia = 0;
+        uint32_t sumaL = 0;
         for (int i = 0; i < numMuestras; i++)
-            sumaLluvia += adc1_get_raw(sensorLluvia);
-        uint32_t promedioLluvia = sumaLluvia / numMuestras;
-        humedad = (promedioLluvia * 100.0f) / 4095.0f;
+            sumaL += adc1_get_raw(sensorLluvia);
+        uint32_t promL = sumaL / numMuestras;
+        humedad = redondear((promL * 100.0f) / 4095.0f, 1);
 
         ESP_LOGI(TAG, "\n==== LECTURAS ====\n"
-                      "Turbidez : %.2f NTU\n"
-                      "Voltaje  : %.2f V\n"
-                      "Humedad  : %.2f %%\n"
-                      "Flujo    : %.2f L/min\n"
-                      "Litros   : %.2f L\n"
-                      "Nivel agua: %.2f cm\n"
-                      "Llenado  : %.1f %%\n"
-                      "==================\n",
-                 valorNTU, voltaje, humedad, flujo, litros,
-                 nivelAgua.nivel, nivelAgua.llenado);
+              "Turbidez : %.2f NTU\n"
+              "Voltaje  : %.2f V\n"
+              "Humedad  : %.2f %%\n"
+              "Flujo    : %.2f L/min\n"
+              "Litros   : %.2f L\n"
+              "Nivel agua: %.2f cm\n"
+              "Llenado  : %.1f %%\n"
+              "==================\n",
+         valorNTU, voltaje, humedad, flujo, litros, 
+         nivelAgua.nivel, nivelAgua.llenado);
     }
 }

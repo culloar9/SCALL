@@ -1,4 +1,3 @@
-EMISOR 1 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,35 +13,43 @@ EMISOR 1
 
 #define TRIG_PIN GPIO_NUM_4
 #define ECHO_PIN GPIO_NUM_5
-#define ALTURA_VASO_CM 12.0f   // Altura del vaso en centímetros
-#define CANAL_WIFI 2           // Canal del router/receptor
+#define PIN_FLUJO GPIO_NUM_26
+#define ALTURA_VASO_CM 12.0f
+#define CANAL_WIFI 2
 
-static const char *TAG = "EMISOR_ULTRA";
+static const char *TAG = "EMISOR_ULTRA_FLUJO";
 
-// Estructura a enviar al receptor
+// ====== ESTRUCTURA A ENVIAR ======
 typedef struct {
     float distancia;
     float nivel;
     float llenado;
-} NivelData;
+    float flujo;     // L/min
+    float litros;    // Total acumulado
+} NivelFlujoData;
 
-NivelData datos;
+NivelFlujoData datos;
 
-// MAC del receptor (reemplázala con la tuya)
+// Variables internas del sensor de flujo
+volatile uint32_t contadorPulsos = 0;
+uint64_t totalPulsos = 0;
+
+// MAC del receptor (ajústala a la del cerebro SCALL)
 uint8_t receptor_mac[] = {0xA4, 0xCF, 0x12, 0x88, 0x39, 0x2C};
 
-// ────────────────────────────────────────────────
-// FUNCIONES DE MEDICIÓN
-// ────────────────────────────────────────────────
+// ====== INTERRUPCIÓN DEL SENSOR DE FLUJO ======
+static void IRAM_ATTR interrupcionFlujo(void *arg) {
+    contadorPulsos++;
+}
+
+// ====== MEDICIÓN DE NIVEL ======
 static void medirNivelAgua(void) {
-    // Generar pulso de disparo
     gpio_set_level(TRIG_PIN, 0);
     esp_rom_delay_us(2);
     gpio_set_level(TRIG_PIN, 1);
     esp_rom_delay_us(10);
     gpio_set_level(TRIG_PIN, 0);
 
-    // Esperar eco
     int64_t start = esp_timer_get_time();
     while (gpio_get_level(ECHO_PIN) == 0)
         start = esp_timer_get_time();
@@ -51,12 +58,10 @@ static void medirNivelAgua(void) {
     while (gpio_get_level(ECHO_PIN) == 1)
         end = esp_timer_get_time();
 
-    // Calcular duración y distancia
-    float duracion = (end - start);        // en microsegundos
-    datos.distancia = duracion / 58.0f;    // cm (divisor 58 proviene de la velocidad del sonido)
+    float duracion = (end - start);
+    datos.distancia = duracion / 58.0f;
     datos.nivel = ALTURA_VASO_CM - datos.distancia;
 
-    // Limitar valores a rango válido
     if (datos.nivel < 0) datos.nivel = 0;
     if (datos.nivel > ALTURA_VASO_CM) datos.nivel = ALTURA_VASO_CM;
 
@@ -65,14 +70,22 @@ static void medirNivelAgua(void) {
     if (datos.llenado > 100) datos.llenado = 100;
 }
 
-// Callback de confirmación de envío
+// ====== MEDICIÓN DE FLUJO ======
+static void medirFlujo(void) {
+    contadorPulsos = 0;
+    vTaskDelay(pdMS_TO_TICKS(2000)); // mide durante 2 segundos
+
+    totalPulsos += contadorPulsos;
+    datos.flujo = contadorPulsos / 7.5f;
+    datos.litros = totalPulsos / 450.0f;
+}
+
+// ====== CALLBACK DE ENVÍO ======
 static void on_data_sent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     ESP_LOGI(TAG, "Estado de envío: %s", status == ESP_NOW_SEND_SUCCESS ? "ÉXITO" : "FALLÓ");
 }
 
-// ────────────────────────────────────────────────
-// INICIALIZACIÓN DE WIFI Y ESPNOW
-// ────────────────────────────────────────────────
+// ====== INICIALIZACIÓN WIFI Y ESPNOW ======
 static void init_wifi(void) {
     esp_netif_init();
     esp_event_loop_create_default();
@@ -82,8 +95,6 @@ static void init_wifi(void) {
     esp_wifi_init(&cfg);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start();
-
-    // 🔥 Fuerza el canal del receptor (canal 2 según tu log)
     esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE);
 
     uint8_t mac[6];
@@ -109,9 +120,7 @@ static void init_espnow(void) {
     }
 }
 
-// ────────────────────────────────────────────────
-// ENVÍO DE DATOS CON REINTENTOS
-// ────────────────────────────────────────────────
+// ====== ENVÍO DE DATOS ======
 static void enviar_datos(void) {
     for (int intento = 1; intento <= 3; intento++) {
         esp_err_t res = esp_now_send(receptor_mac, (uint8_t *)&datos, sizeof(datos));
@@ -125,30 +134,40 @@ static void enviar_datos(void) {
     }
 }
 
-// ────────────────────────────────────────────────
-// PROGRAMA PRINCIPAL
-// ────────────────────────────────────────────────
+// ====== PROGRAMA PRINCIPAL ======
 void app_main(void) {
     nvs_flash_init();
     init_wifi();
     init_espnow();
 
-    // Configurar pines
     gpio_reset_pin(TRIG_PIN);
     gpio_reset_pin(ECHO_PIN);
     gpio_set_direction(TRIG_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(ECHO_PIN, GPIO_MODE_INPUT);
     gpio_set_level(TRIG_PIN, 0);
 
+    // Configurar pin de flujo con interrupción
+    gpio_config_t cfg = {
+        .intr_type = GPIO_INTR_POSEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << PIN_FLUJO),
+        .pull_down_en = 0,
+        .pull_up_en = 1};
+    gpio_config(&cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_FLUJO, interrupcionFlujo, NULL);
+
+    ESP_LOGI(TAG, "✓ Emisor Ultrasónico + Flujo listo");
+
     while (1) {
         medirNivelAgua();
+        medirFlujo();
 
-        ESP_LOGI(TAG, "Distancia: %.2f cm | Nivel: %.2f cm | Llenado: %.1f%%",
-                 datos.distancia, datos.nivel, datos.llenado);
+        ESP_LOGI(TAG, "Dist: %.2f cm | Nivel: %.2f cm | Llenado: %.1f%% | Flujo: %.2f L/min | Litros: %.2f L",
+                 datos.distancia, datos.nivel, datos.llenado, datos.flujo, datos.litros);
 
         enviar_datos();
 
-        // Esperar 2 segundos entre lecturas
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

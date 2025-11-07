@@ -16,6 +16,8 @@
 #define PIN_FLUJO GPIO_NUM_26
 #define ALTURA_VASO_CM 12.0f
 #define CANAL_WIFI 2
+#define ALTURA_TOTAL_CM  12.0f   // Altura física total del tinaco
+#define OFFSET_SENSOR_CM 3.0f    // Margen desde el sensor al nivel máximo, 3cm para el diseño de la maqueta
 
 static const char *TAG = "EMISOR_ULTRA_FLUJO";
 
@@ -44,28 +46,35 @@ static void IRAM_ATTR interrupcionFlujo(void *arg) {
 
 // ====== MEDICIÓN DE NIVEL ======
 static void medirNivelAgua(void) {
+    // --- Disparo ultrasónico ---
     gpio_set_level(TRIG_PIN, 0);
     esp_rom_delay_us(2);
     gpio_set_level(TRIG_PIN, 1);
     esp_rom_delay_us(10);
     gpio_set_level(TRIG_PIN, 0);
 
+    // --- Medición del tiempo de eco ---
     int64_t start = esp_timer_get_time();
-    while (gpio_get_level(ECHO_PIN) == 0)
-        start = esp_timer_get_time();
+    int64_t timeout = start + 40000; // 40 ms (máx ~6.8 m)
+    while (gpio_get_level(ECHO_PIN) == 0 && esp_timer_get_time() < timeout);
+    start = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 1 && esp_timer_get_time() < timeout);
+    int64_t end = esp_timer_get_time();
 
-    int64_t end = start;
-    while (gpio_get_level(ECHO_PIN) == 1)
-        end = esp_timer_get_time();
+    // --- Cálculo de distancia ---
+    float duracion = (float)(end - start);
+    datos.distancia = duracion / 58.0f; // cm
 
-    float duracion = (end - start);
-    datos.distancia = duracion / 58.0f;
-    datos.nivel = ALTURA_VASO_CM - datos.distancia;
+    // --- Compensar el offset del sensor ---
+    float distancia_util = datos.distancia - OFFSET_SENSOR_CM;
+    if (distancia_util < 0) distancia_util = 0;                   // evitar valores negativos
+    if (distancia_util > ALTURA_TOTAL_CM) distancia_util = ALTURA_TOTAL_CM; // evitar valores fuera de rango
 
-    if (datos.nivel < 0) datos.nivel = 0;
-    if (datos.nivel > ALTURA_VASO_CM) datos.nivel = ALTURA_VASO_CM;
+    // --- Calcular nivel real y llenado ---
+    datos.nivel = ALTURA_TOTAL_CM - distancia_util;
+    datos.llenado = (datos.nivel / ALTURA_TOTAL_CM) * 100.0f;
 
-    datos.llenado = (datos.nivel / ALTURA_VASO_CM) * 100.0f;
+    // --- Asegurar límites ---
     if (datos.llenado < 0) datos.llenado = 0;
     if (datos.llenado > 100) datos.llenado = 100;
 }

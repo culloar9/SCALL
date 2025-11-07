@@ -215,14 +215,14 @@ static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) 
     if (len == sizeof(LluviaData)) {
         // Datos de LLUVIA
         memcpy(&datosLluvia, data, sizeof(LluviaData));
-        ESP_LOGI("ESP-NOW", "🌧️ LLUVIA -> H1:%.1f%% H2:%.1f%% H3:%.1f%% Prom:%.1f%%",
+        ESP_LOGI("ESP-NOW", "  LLUVIA -> H1:%.1f%% H2:%.1f%% H3:%.1f%% Prom:%.1f%%",
                  datosLluvia.humedad1, datosLluvia.humedad2, 
                  datosLluvia.humedad3, datosLluvia.promedio);
     } 
     else if (len == sizeof(NivelFlujoData)) {
         // Datos de NIVEL+FLUJO
         memcpy(&datosNivelFlujo, data, sizeof(NivelFlujoData));
-        ESP_LOGI("ESP-NOW", "💧 NIVEL+FLUJO -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min",
+        ESP_LOGI("ESP-NOW", "  NIVEL+FLUJO -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min",
                  datosNivelFlujo.distancia, datosNivelFlujo.nivel, 
                  datosNivelFlujo.llenado, datosNivelFlujo.flujo);
     }
@@ -270,7 +270,7 @@ bool cargarCredencialesWiFi(char *ssid, char *password) {
 // ======================================================
 bool hayaCambiosSignificativos(void) {
     if (primeraLectura) {
-        ESP_LOGI(TAG, "📤 Primera lectura - publicando");
+        ESP_LOGI(TAG, " Primera lectura - publicando");
         primeraLectura = false;
         return true;
     }
@@ -313,7 +313,7 @@ bool hayaCambiosSignificativos(void) {
     // Heartbeat
     uint64_t ahora = esp_timer_get_time() / 1000;
     if ((ahora - ultimaPublicacion) > TIEMPO_HEARTBEAT) {
-        ESP_LOGI(TAG, "💓 Heartbeat (60s)");
+        ESP_LOGI(TAG, " Heartbeat (60s)");
         cambio = true;
     }
 
@@ -779,16 +779,16 @@ void app_main(void) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "     SCALL ESP32 - CENTRAL");
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "🔬 SENSORES LOCALES:");
+    ESP_LOGI(TAG, "  SENSORES LOCALES:");
     ESP_LOGI(TAG, "   ├─ pH (GPIO35)");
     ESP_LOGI(TAG, "   ├─ TDS/NTU (GPIO34)");
     ESP_LOGI(TAG, "   └─ Relay (GPIO27)");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "📡 SENSORES REMOTOS (ESP-NOW):");
+    ESP_LOGI(TAG, "  SENSORES REMOTOS (ESP-NOW):");
     ESP_LOGI(TAG, "   ├─ Emisor #1: Lluvia (3 sensores)");
     ESP_LOGI(TAG, "   └─ Emisor #2: Nivel + Flujo");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "⚙️  OPTIMIZACIÓN: 30 muestras/sensor");
+    ESP_LOGI(TAG, "   OPTIMIZACIÓN: 30 muestras/sensor");
     ESP_LOGI(TAG, "========================================\n");
 
     // Inicializar BLE para configuración
@@ -842,7 +842,7 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(2000));
 
         if (!wifiConectado) {
-            ESP_LOGI(TAG, "⏳ Esperando conexión WiFi...");
+            ESP_LOGI(TAG, "Esperando conexión WiFi...");
             continue;
         }
 
@@ -854,22 +854,22 @@ void app_main(void) {
         ESP_LOGI(TAG, "\n╔════════════════════════════════════╗");
         ESP_LOGI(TAG, "║      LECTURAS COMPLETAS            ║");
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║ 🔬 SENSORES LOCALES:               ║");
-        ESP_LOGI(TAG, "║   pH         : %.2f                ║", valorPH);
+        ESP_LOGI(TAG, "║    SENSORES LOCALES:               ║");
+        ESP_LOGI(TAG, "║   pH         : %.2f               ║", valorPH);
         ESP_LOGI(TAG, "║   Voltaje pH : %.2f V              ║", voltajePH);
-        ESP_LOGI(TAG, "║   NTU        : %.2f                ║", valorNTU);
+        ESP_LOGI(TAG, "║   NTU        : %.2f              ║", valorNTU);
         ESP_LOGI(TAG, "║   Voltaje TDS: %.2f V              ║", voltajeTDS);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║ 🌧️  SENSORES REMOTOS - LLUVIA:     ║");
-        ESP_LOGI(TAG, "║   Humedad 1  : %.1f%%               ║", datosLluvia.humedad1);
-        ESP_LOGI(TAG, "║   Humedad 2  : %.1f%%               ║", datosLluvia.humedad2);
-        ESP_LOGI(TAG, "║   Humedad 3  : %.1f%%               ║", datosLluvia.humedad3);
-        ESP_LOGI(TAG, "║   Promedio   : %.1f%%               ║", datosLluvia.promedio);
+        ESP_LOGI(TAG, "║     SENSORES REMOTOS - LLUVIA:     ║");
+        ESP_LOGI(TAG, "║   Humedad 1  : %.1f%%              ║", datosLluvia.humedad1);
+        ESP_LOGI(TAG, "║   Humedad 2  : %.1f%%              ║", datosLluvia.humedad2);
+        ESP_LOGI(TAG, "║   Humedad 3  : %.1f%%              ║", datosLluvia.humedad3);
+        ESP_LOGI(TAG, "║   Promedio   : %.1f%%              ║", datosLluvia.promedio);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║ 💧 SENSORES REMOTOS - NIVEL+FLUJO: ║");
+        ESP_LOGI(TAG, "║ SENSORES REMOTOS - NIVEL+FLUJO:    ║");
         ESP_LOGI(TAG, "║   Distancia  : %.2f cm             ║", datosNivelFlujo.distancia);
         ESP_LOGI(TAG, "║   Nivel      : %.2f cm             ║", datosNivelFlujo.nivel);
-        ESP_LOGI(TAG, "║   Llenado    : %.1f%%               ║", datosNivelFlujo.llenado);
+        ESP_LOGI(TAG, "║   Llenado    : %.1f%%              ║", datosNivelFlujo.llenado);
         ESP_LOGI(TAG, "║   Flujo      : %.2f L/min          ║", datosNivelFlujo.flujo);
         ESP_LOGI(TAG, "║   Litros     : %.2f L              ║", datosNivelFlujo.litros);
         ESP_LOGI(TAG, "╚════════════════════════════════════╝\n");

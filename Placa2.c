@@ -23,6 +23,7 @@
 #include "mqtt_client.h"
 #include "certificates.h"
 #include "esp_now.h"
+#include "esp_rom_sys.h"
 
 // ======================================================
 // DEFINICIONES DE PINES
@@ -31,6 +32,14 @@
 #define SENSOR_TDS ADC1_CHANNEL_6    // GPIO34 - Turbidez/TDS
 #define SENSOR_PH  ADC1_CHANNEL_7    // GPIO35 - pH
 #define PIN_RELAY  GPIO_NUM_27       // Control de relay
+
+// SENSOR ULTRASÓNICO (LOCAL) - NUEVO
+#define TRIG_PIN   GPIO_NUM_4        // Trigger del HC-SR04
+#define ECHO_PIN   GPIO_NUM_5        // Echo del HC-SR04
+
+// CONFIGURACIÓN SENSOR ULTRASÓNICO
+#define ALTURA_TOTAL_CM  12.0f       // Altura física total del tinaco
+#define OFFSET_SENSOR_CM 3.0f        // Margen desde el sensor al nivel máximo
 
 // CONFIGURACIÓN ADC
 #define VOLTAJE_REF 1100
@@ -50,6 +59,11 @@ int tdsArray[NUM_MUESTRAS];
 float valorPH = 0, voltajePH = 0;
 int pHArray[NUM_MUESTRAS];
 
+// Sensor Ultrasónico (LOCAL) - NUEVO
+float distanciaUltra = 0;    // Distancia medida en cm
+float nivelAgua = 0;         // Nivel de agua en cm
+float llenadoTinaco = 0;     // Porcentaje de llenado
+
 // ======================================================
 // ESTRUCTURAS DE DATOS REMOTOS (ESP-NOW)
 // ======================================================
@@ -63,7 +77,7 @@ typedef struct {
 
 LluviaData datosLluvia = {0};
 
-// Datos de NIVEL+FLUJO (de ESP32 emisora #2)
+// Datos de NIVEL+FLUJO (de ESP32 emisora #2) - REMOTO
 typedef struct {
     float distancia;
     float nivel;
@@ -93,7 +107,9 @@ char mqtt_uri[256] = {0};
 // ======================================================
 float prevNTU, prevPH;
 float prevHumedad1, prevHumedad2, prevHumedad3, prevHumedadProm;
-float prevNivel, prevLlenado, prevFlujo, prevLitros;
+float prevDistancia, prevNivel, prevLlenado;  // Ultrasónico LOCAL
+float prevDistanciaRemota, prevNivelRemoto, prevLlenadoRemoto;  // Ultrasónico REMOTO
+float prevFlujo, prevLitros;
 bool primeraLectura = true;
 uint64_t ultimaPublicacion = 0;
 
@@ -101,6 +117,7 @@ uint64_t ultimaPublicacion = 0;
 #define UMBRAL_NTU 5.0f
 #define UMBRAL_PH 0.2f
 #define UMBRAL_HUMEDAD 5.0f
+#define UMBRAL_DISTANCIA 1.0f
 #define UMBRAL_NIVEL 2.0f
 #define UMBRAL_LLENADO 5.0f
 #define UMBRAL_FLUJO 0.5f
@@ -208,6 +225,52 @@ float leerTDS(esp_adc_cal_characteristics_t *ch) {
 }
 
 // ======================================================
+// SENSOR ULTRASÓNICO (LOCAL) - NUEVO
+// ======================================================
+void medirNivelAgua(void) {
+    // --- Disparo ultrasónico ---
+    gpio_set_level(TRIG_PIN, 0);
+    esp_rom_delay_us(2);
+    gpio_set_level(TRIG_PIN, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(TRIG_PIN, 0);
+
+    // --- Medición del tiempo de eco ---
+    int64_t start = esp_timer_get_time();
+    int64_t timeout = start + 40000; // 40 ms (máx ~6.8 m)
+    
+    // Esperar a que ECHO se ponga en HIGH
+    while (gpio_get_level(ECHO_PIN) == 0 && esp_timer_get_time() < timeout);
+    start = esp_timer_get_time();
+    
+    // Esperar a que ECHO se ponga en LOW
+    while (gpio_get_level(ECHO_PIN) == 1 && esp_timer_get_time() < timeout);
+    int64_t end = esp_timer_get_time();
+
+    // --- Cálculo de distancia ---
+    float duracion = (float)(end - start);
+    distanciaUltra = duracion / 58.0f; // cm
+
+    // --- Compensar el offset del sensor ---
+    float distancia_util = distanciaUltra - OFFSET_SENSOR_CM;
+    if (distancia_util < 0) distancia_util = 0;                   
+    if (distancia_util > ALTURA_TOTAL_CM) distancia_util = ALTURA_TOTAL_CM;
+
+    // --- Calcular nivel real y llenado ---
+    nivelAgua = ALTURA_TOTAL_CM - distancia_util;
+    llenadoTinaco = (nivelAgua / ALTURA_TOTAL_CM) * 100.0f;
+
+    // --- Asegurar límites ---
+    if (llenadoTinaco < 0) llenadoTinaco = 0;
+    if (llenadoTinaco > 100) llenadoTinaco = 100;
+
+    // Redondear valores
+    distanciaUltra = redondear(distanciaUltra, 2);
+    nivelAgua = redondear(nivelAgua, 2);
+    llenadoTinaco = redondear(llenadoTinaco, 1);
+}
+
+// ======================================================
 // ESP-NOW - RECIBIR DATOS REMOTOS
 // ======================================================
 static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) {
@@ -220,11 +283,11 @@ static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) 
                  datosLluvia.humedad3, datosLluvia.promedio);
     } 
     else if (len == sizeof(NivelFlujoData)) {
-        // Datos de NIVEL+FLUJO
+        // Datos de NIVEL+FLUJO (Ultrasónico REMOTO)
         memcpy(&datosNivelFlujo, data, sizeof(NivelFlujoData));
-        ESP_LOGI("ESP-NOW", "  NIVEL+FLUJO -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min",
+        ESP_LOGI("ESP-NOW", "  NIVEL+FLUJO (REMOTO) -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min Litros:%.2fL",
                  datosNivelFlujo.distancia, datosNivelFlujo.nivel, 
-                 datosNivelFlujo.llenado, datosNivelFlujo.flujo);
+                 datosNivelFlujo.llenado, datosNivelFlujo.flujo, datosNivelFlujo.litros);
     }
 }
 
@@ -288,15 +351,41 @@ bool hayaCambiosSignificativos(void) {
         cambio = true;
     }
 
+    // Sensor ULTRASÓNICO LOCAL - NUEVO
+    if (fabs(distanciaUltra - prevDistancia) > UMBRAL_DISTANCIA) {
+        ESP_LOGI(TAG, "△ Distancia LOCAL: %.2f → %.2f cm", prevDistancia, distanciaUltra);
+        cambio = true;
+    }
+
+    if (fabs(nivelAgua - prevNivel) > UMBRAL_NIVEL) {
+        ESP_LOGI(TAG, "△ Nivel LOCAL: %.2f → %.2f cm", prevNivel, nivelAgua);
+        cambio = true;
+    }
+
+    if (fabs(llenadoTinaco - prevLlenado) > UMBRAL_LLENADO) {
+        ESP_LOGI(TAG, "△ Llenado LOCAL: %.1f → %.1f%%", prevLlenado, llenadoTinaco);
+        cambio = true;
+    }
+
     // Sensores REMOTOS - Lluvia
     if (fabs(datosLluvia.promedio - prevHumedadProm) > UMBRAL_HUMEDAD) {
         ESP_LOGI(TAG, "△ Humedad: %.1f → %.1f", prevHumedadProm, datosLluvia.promedio);
         cambio = true;
     }
 
-    // Sensores REMOTOS - Nivel+Flujo
-    if (fabs(datosNivelFlujo.nivel - prevNivel) > UMBRAL_NIVEL) {
-        ESP_LOGI(TAG, "△ Nivel: %.2f → %.2f", prevNivel, datosNivelFlujo.nivel);
+    // Sensores REMOTOS - Nivel+Flujo (Ultrasónico REMOTO)
+    if (fabs(datosNivelFlujo.distancia - prevDistanciaRemota) > UMBRAL_DISTANCIA) {
+        ESP_LOGI(TAG, "△ Distancia REMOTA: %.2f → %.2f cm", prevDistanciaRemota, datosNivelFlujo.distancia);
+        cambio = true;
+    }
+
+    if (fabs(datosNivelFlujo.nivel - prevNivelRemoto) > UMBRAL_NIVEL) {
+        ESP_LOGI(TAG, "△ Nivel REMOTO: %.2f → %.2f cm", prevNivelRemoto, datosNivelFlujo.nivel);
+        cambio = true;
+    }
+
+    if (fabs(datosNivelFlujo.llenado - prevLlenadoRemoto) > UMBRAL_LLENADO) {
+        ESP_LOGI(TAG, "△ Llenado REMOTO: %.1f → %.1f%%", prevLlenadoRemoto, datosNivelFlujo.llenado);
         cambio = true;
     }
 
@@ -332,7 +421,7 @@ void publicarDatosAWS(void) {
     time_t now = time(NULL);
     int relay_estado = gpio_get_level(PIN_RELAY);
 
-    char payload[800];
+    char payload[1000];
     snprintf(payload, sizeof(payload),
              "{"
              "\"device_id\":\"%s\","
@@ -343,15 +432,19 @@ void publicarDatosAWS(void) {
              "\"ntu\":%.2f,"
              "\"voltaje_tds\":%.2f,"
              "\"relay\":\"%s\","
+             // SENSOR ULTRASÓNICO LOCAL (Tinaco Principal)
+             "\"distancia_local\":%.2f,"
+             "\"nivel_local\":%.2f,"
+             "\"llenado_local\":%.1f,"
              // SENSORES REMOTOS - LLUVIA
              "\"humedad1\":%.1f,"
              "\"humedad2\":%.1f,"
              "\"humedad3\":%.1f,"
              "\"humedad_promedio\":%.1f,"
-             // SENSORES REMOTOS - NIVEL+FLUJO
-             "\"distancia\":%.2f,"
-             "\"nivel\":%.2f,"
-             "\"llenado\":%.1f,"
+             // SENSORES REMOTOS - NIVEL+FLUJO (Ultrasónico Remoto + Flujo)
+             "\"distancia_remota\":%.2f,"
+             "\"nivel_remoto\":%.2f,"
+             "\"llenado_remoto\":%.1f,"
              "\"flujo\":%.2f,"
              "\"litros\":%.2f"
              "}",
@@ -360,6 +453,8 @@ void publicarDatosAWS(void) {
              valorPH, voltajePH,
              valorNTU, voltajeTDS,
              relay_estado ? "on" : "off",
+             // ULTRASÓNICO LOCAL
+             distanciaUltra, nivelAgua, llenadoTinaco,
              // REMOTOS - LLUVIA
              datosLluvia.humedad1,
              datosLluvia.humedad2,
@@ -480,19 +575,25 @@ void iniciarMQTT(void) {
 // HTTP - Servidor Web
 // ======================================================
 static esp_err_t manejadorDatos(httpd_req_t *req) {
-    char res[500];
+    char res[700];
     snprintf(res, sizeof(res),
              "{"
              "\"ph\":%.2f,"
              "\"ntu\":%.2f,"
+             "\"distancia_local\":%.2f,"
+             "\"nivel_local\":%.2f,"
+             "\"llenado_local\":%.1f,"
              "\"humedad_prom\":%.1f,"
-             "\"nivel\":%.2f,"
-             "\"llenado\":%.1f,"
+             "\"distancia_remota\":%.2f,"
+             "\"nivel_remoto\":%.2f,"
+             "\"llenado_remoto\":%.1f,"
              "\"flujo\":%.2f,"
              "\"litros\":%.2f"
              "}",
              valorPH, valorNTU,
+             distanciaUltra, nivelAgua, llenadoTinaco,
              datosLluvia.promedio,
+             datosNivelFlujo.distancia,
              datosNivelFlujo.nivel,
              datosNivelFlujo.llenado,
              datosNivelFlujo.flujo,
@@ -751,13 +852,21 @@ void tarea_publicacion_aws(void *pv) {
             if (hayaCambiosSignificativos()) {
                 publicarDatosAWS();
 
-                // Actualizar valores previos
+                // Actualizar valores previos - SENSORES LOCALES
                 prevNTU = valorNTU;
                 prevPH = valorPH;
+                prevDistancia = distanciaUltra;
+                prevNivel = nivelAgua;
+                prevLlenado = llenadoTinaco;
+                
+                // Actualizar valores previos - REMOTOS
                 prevHumedadProm = datosLluvia.promedio;
-                prevNivel = datosNivelFlujo.nivel;
+                prevDistanciaRemota = datosNivelFlujo.distancia;
+                prevNivelRemoto = datosNivelFlujo.nivel;
+                prevLlenadoRemoto = datosNivelFlujo.llenado;
                 prevFlujo = datosNivelFlujo.flujo;
                 prevLitros = datosNivelFlujo.litros;
+                
                 ultimaPublicacion = esp_timer_get_time() / 1000;
             }
         }
@@ -777,18 +886,20 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "     SCALL ESP32 - CENTRAL");
+    ESP_LOGI(TAG, "     SCALL ESP32 - CENTRAL V2.0");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  SENSORES LOCALES:");
     ESP_LOGI(TAG, "   ├─ pH (GPIO35)");
     ESP_LOGI(TAG, "   ├─ TDS/NTU (GPIO34)");
+    ESP_LOGI(TAG, "   ├─ Ultrasónico LOCAL (GPIO4/5)");
     ESP_LOGI(TAG, "   └─ Relay (GPIO27)");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "  SENSORES REMOTOS (ESP-NOW):");
     ESP_LOGI(TAG, "   ├─ Emisor #1: Lluvia (3 sensores)");
-    ESP_LOGI(TAG, "   └─ Emisor #2: Nivel + Flujo");
+    ESP_LOGI(TAG, "   └─ Emisor #2: Ultrasónico REMOTO + Flujo");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "   OPTIMIZACIÓN: 30 muestras/sensor");
+    ESP_LOGI(TAG, "   OFFSET ULTRASÓNICO: %.1f cm", OFFSET_SENSOR_CM);
     ESP_LOGI(TAG, "========================================\n");
 
     // Inicializar BLE para configuración
@@ -824,6 +935,14 @@ void app_main(void) {
     esp_adc_cal_characteristics_t ch;
     esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, VOLTAJE_REF, &ch);
 
+    // Configurar pines del sensor ULTRASÓNICO - NUEVO
+    gpio_reset_pin(TRIG_PIN);
+    gpio_reset_pin(ECHO_PIN);
+    gpio_set_direction(TRIG_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ECHO_PIN, GPIO_MODE_INPUT);
+    gpio_set_level(TRIG_PIN, 0);
+    ESP_LOGI(TAG, "✓ Sensor Ultrasónico configurado (HC-SR04)");
+
     // Configurar relay
     gpio_reset_pin(PIN_RELAY);
     gpio_set_direction(PIN_RELAY, GPIO_MODE_OUTPUT);
@@ -849,6 +968,7 @@ void app_main(void) {
         // ===== LEER SENSORES LOCALES =====
         valorNTU = leerTDS(&ch);
         valorPH = leerPH(&ch);
+        medirNivelAgua();  // NUEVO: Lectura del sensor ultrasónico
 
         // Log de TODAS las lecturas (locales + remotas)
         ESP_LOGI(TAG, "\n╔════════════════════════════════════╗");
@@ -860,16 +980,23 @@ void app_main(void) {
         ESP_LOGI(TAG, "║   NTU        : %.2f              ║", valorNTU);
         ESP_LOGI(TAG, "║   Voltaje TDS: %.2f V              ║", voltajeTDS);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
+        ESP_LOGI(TAG, "║  ULTRASÓNICO LOCAL (Tinaco 1):     ║");
+        ESP_LOGI(TAG, "║   Distancia  : %.2f cm             ║", distanciaUltra);
+        ESP_LOGI(TAG, "║   Nivel Agua : %.2f cm             ║", nivelAgua);
+        ESP_LOGI(TAG, "║   Llenado    : %.1f%%              ║", llenadoTinaco);
+        ESP_LOGI(TAG, "╠════════════════════════════════════╣");
         ESP_LOGI(TAG, "║     SENSORES REMOTOS - LLUVIA:     ║");
         ESP_LOGI(TAG, "║   Humedad 1  : %.1f%%              ║", datosLluvia.humedad1);
         ESP_LOGI(TAG, "║   Humedad 2  : %.1f%%              ║", datosLluvia.humedad2);
         ESP_LOGI(TAG, "║   Humedad 3  : %.1f%%              ║", datosLluvia.humedad3);
         ESP_LOGI(TAG, "║   Promedio   : %.1f%%              ║", datosLluvia.promedio);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
-        ESP_LOGI(TAG, "║ SENSORES REMOTOS - NIVEL+FLUJO:    ║");
+        ESP_LOGI(TAG, "║ ULTRASÓNICO REMOTO (Tinaco 2):     ║");
         ESP_LOGI(TAG, "║   Distancia  : %.2f cm             ║", datosNivelFlujo.distancia);
         ESP_LOGI(TAG, "║   Nivel      : %.2f cm             ║", datosNivelFlujo.nivel);
         ESP_LOGI(TAG, "║   Llenado    : %.1f%%              ║", datosNivelFlujo.llenado);
+        ESP_LOGI(TAG, "╠════════════════════════════════════╣");
+        ESP_LOGI(TAG, "║   SENSOR REMOTO - FLUJO:           ║");
         ESP_LOGI(TAG, "║   Flujo      : %.2f L/min          ║", datosNivelFlujo.flujo);
         ESP_LOGI(TAG, "║   Litros     : %.2f L              ║", datosNivelFlujo.litros);
         ESP_LOGI(TAG, "╚════════════════════════════════════╝\n");

@@ -33,7 +33,7 @@
 #define SENSOR_PH  ADC1_CHANNEL_7    // GPIO35 - pH
 #define PIN_RELAY  GPIO_NUM_27       // Control de relay
 
-// SENSOR ULTRASÓNICO (LOCAL) - NUEVO
+// SENSOR ULTRASÓNICO (LOCAL)
 #define TRIG_PIN   GPIO_NUM_4        // Trigger del HC-SR04
 #define ECHO_PIN   GPIO_NUM_5        // Echo del HC-SR04
 
@@ -49,6 +49,26 @@
 static const char *TAG = "SCALL-CENTRAL";
 
 // ======================================================
+// CÓDIGOS DE EVENTO (deben coincidir con el emisor)
+// ======================================================
+#define EVT_RUTINA          0
+#define EVT_INICIO_LLUVIA   1
+#define EVT_INICIO_CAPTACION 2
+#define EVT_FIN_CAPTACION   3
+#define EVT_FIN_LLUVIA      4
+#define EVT_FALLA_SENSOR    5
+
+// Descripciones de eventos para JSON
+const char* descripciones_evento[] = {
+    "rutina",
+    "inicio_lluvia",
+    "inicio_captacion",
+    "fin_captacion",
+    "fin_lluvia",
+    "falla_sensor"
+};
+
+// ======================================================
 // VARIABLES GLOBALES - SENSORES LOCALES
 // ======================================================
 // Sensor TDS/Turbidez (LOCAL)
@@ -59,7 +79,7 @@ int tdsArray[NUM_MUESTRAS];
 float valorPH = 0, voltajePH = 0;
 int pHArray[NUM_MUESTRAS];
 
-// Sensor Ultrasónico (LOCAL) - NUEVO
+// Sensor Ultrasónico (LOCAL)
 float distanciaUltra = 0;    // Distancia medida en cm
 float nivelAgua = 0;         // Nivel de agua en cm
 float llenadoTinaco = 0;     // Porcentaje de llenado
@@ -67,12 +87,14 @@ float llenadoTinaco = 0;     // Porcentaje de llenado
 // ======================================================
 // ESTRUCTURAS DE DATOS REMOTOS (ESP-NOW)
 // ======================================================
-// Datos de LLUVIA (de ESP32 emisora #1)
+// Datos de LLUVIA (de ESP32 emisora #1) - ACTUALIZADA
 typedef struct {
     float humedad1;
     float humedad2;
     float humedad3;
     float promedio;
+    uint8_t evento;        // 0 = rutina, 1-4 = lluvia, 5 = falla
+    uint8_t sensor_falla;  // 0 = ninguno, 1 = L1, 2 = L2, 3 = L3
 } LluviaData;
 
 LluviaData datosLluvia = {0};
@@ -100,6 +122,7 @@ char device_id[20] = {0};
 esp_mqtt_client_handle_t mqtt_client = NULL;
 char mqtt_topic_data[100] = {0};
 char mqtt_topic_command[100] = {0};
+char mqtt_topic_events[100] = {0};  // NUEVO: Topic para eventos
 char mqtt_uri[256] = {0};
 
 // ======================================================
@@ -225,7 +248,7 @@ float leerTDS(esp_adc_cal_characteristics_t *ch) {
 }
 
 // ======================================================
-// SENSOR ULTRASÓNICO (LOCAL) - NUEVO
+// SENSOR ULTRASÓNICO (LOCAL)
 // ======================================================
 void medirNivelAgua(void) {
     // --- Disparo ultrasónico ---
@@ -271,21 +294,92 @@ void medirNivelAgua(void) {
 }
 
 // ======================================================
-// ESP-NOW - RECIBIR DATOS REMOTOS
+// PUBLICAR EVENTO A AWS IoT - NUEVO
+// ======================================================
+void publicarEvento(uint8_t evento, uint8_t sensor_falla) {
+    if (!mqttConectado) {
+        ESP_LOGW(TAG, "MQTT no conectado - evento no publicado");
+        return;
+    }
+
+    time_t now = time(NULL);
+    
+    char payload[300];
+    snprintf(payload, sizeof(payload),
+             "{"
+             "\"device_id\":\"%s\","
+             "\"timestamp\":%ld,"
+             "\"evento\":%d,"
+             "\"descripcion\":\"%s\","
+             "\"sensor_falla\":%d,"
+             "\"humedad1\":%.1f,"
+             "\"humedad2\":%.1f,"
+             "\"humedad3\":%.1f,"
+             "\"humedad_promedio\":%.1f"
+             "}",
+             device_id, (long)now,
+             evento,
+             descripciones_evento[evento],
+             sensor_falla,
+             datosLluvia.humedad1,
+             datosLluvia.humedad2,
+             datosLluvia.humedad3,
+             datosLluvia.promedio);
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, mqtt_topic_events, payload, 0, 1, 0);
+    if (msg_id > 0) {
+        ESP_LOGW(TAG, "🔔 EVENTO publicado: %s (msg_id=%d)", descripciones_evento[evento], msg_id);
+    } else {
+        ESP_LOGE(TAG, "✗ Error al publicar evento");
+    }
+}
+
+// ======================================================
+// ESP-NOW - RECIBIR DATOS REMOTOS - ACTUALIZADO
 // ======================================================
 static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) {
     // Identificar por tamaño de estructura
     if (len == sizeof(LluviaData)) {
         // Datos de LLUVIA
         memcpy(&datosLluvia, data, sizeof(LluviaData));
-        ESP_LOGI("ESP-NOW", "  LLUVIA -> H1:%.1f%% H2:%.1f%% H3:%.1f%% Prom:%.1f%%",
+        
+        // Log básico de datos
+        ESP_LOGI("ESP-NOW", "🌧 LLUVIA -> H1:%.1f%% H2:%.1f%% H3:%.1f%% Prom:%.1f%%",
                  datosLluvia.humedad1, datosLluvia.humedad2, 
                  datosLluvia.humedad3, datosLluvia.promedio);
+        
+        // Si hay un evento (no es rutina), procesarlo
+        if (datosLluvia.evento != EVT_RUTINA) {
+            ESP_LOGW("ESP-NOW", "🔔 EVENTO RECIBIDO: %s", 
+                     descripciones_evento[datosLluvia.evento]);
+            
+            // Publicar evento a AWS IoT
+            publicarEvento(datosLluvia.evento, datosLluvia.sensor_falla);
+            
+            // Log específico según el evento
+            switch (datosLluvia.evento) {
+                case EVT_INICIO_LLUVIA:
+                    ESP_LOGW(TAG, "🌧🌧🌧 ¡EMPIEZA A LLOVER! 🌧🌧🌧");
+                    break;
+                case EVT_INICIO_CAPTACION:
+                    ESP_LOGW(TAG, "💧 Iniciando captación de agua...");
+                    break;
+                case EVT_FIN_CAPTACION:
+                    ESP_LOGW(TAG, "🛑 Terminando captación");
+                    break;
+                case EVT_FIN_LLUVIA:
+                    ESP_LOGW(TAG, "🌤🌤🌤 YA NO ESTÁ LLOVIENDO 🌤🌤🌤");
+                    break;
+                case EVT_FALLA_SENSOR:
+                    ESP_LOGE(TAG, "⚠ FALLA EN SENSOR L%d", datosLluvia.sensor_falla);
+                    break;
+            }
+        }
     } 
     else if (len == sizeof(NivelFlujoData)) {
         // Datos de NIVEL+FLUJO (Ultrasónico REMOTO)
         memcpy(&datosNivelFlujo, data, sizeof(NivelFlujoData));
-        ESP_LOGI("ESP-NOW", "  NIVEL+FLUJO (REMOTO) -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min Litros:%.2fL",
+        ESP_LOGI("ESP-NOW", "📊 NIVEL+FLUJO -> Dist:%.2fcm Nivel:%.2fcm Llenado:%.1f%% Flujo:%.2fL/min Litros:%.2fL",
                  datosNivelFlujo.distancia, datosNivelFlujo.nivel, 
                  datosNivelFlujo.llenado, datosNivelFlujo.flujo, datosNivelFlujo.litros);
     }
@@ -351,7 +445,7 @@ bool hayaCambiosSignificativos(void) {
         cambio = true;
     }
 
-    // Sensor ULTRASÓNICO LOCAL - NUEVO
+    // Sensor ULTRASÓNICO LOCAL
     if (fabs(distanciaUltra - prevDistancia) > UMBRAL_DISTANCIA) {
         ESP_LOGI(TAG, "△ Distancia LOCAL: %.2f → %.2f cm", prevDistancia, distanciaUltra);
         cambio = true;
@@ -532,9 +626,11 @@ void iniciarMQTT(void) {
 
     snprintf(mqtt_topic_data, sizeof(mqtt_topic_data), "device/%s/data", device_id);
     snprintf(mqtt_topic_command, sizeof(mqtt_topic_command), "device/%s/command", device_id);
+    snprintf(mqtt_topic_events, sizeof(mqtt_topic_events), "device/%s/events", device_id);  // NUEVO
 
     ESP_LOGI(TAG, "Topic datos: %s", mqtt_topic_data);
     ESP_LOGI(TAG, "Topic comandos: %s", mqtt_topic_command);
+    ESP_LOGI(TAG, "Topic eventos: %s", mqtt_topic_events);  // NUEVO
 
     strncpy(mqtt_uri, aws_iot_endpoint, sizeof(mqtt_uri) - 1);
     mqtt_uri[sizeof(mqtt_uri) - 1] = '\0';
@@ -886,7 +982,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "     SCALL ESP32 - CENTRAL V2.0");
+    ESP_LOGI(TAG, "     SCALL ESP32 - CENTRAL V2.1");
+    ESP_LOGI(TAG, "        + SISTEMA DE EVENTOS");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  SENSORES LOCALES:");
     ESP_LOGI(TAG, "   ├─ pH (GPIO35)");
@@ -935,7 +1032,7 @@ void app_main(void) {
     esp_adc_cal_characteristics_t ch;
     esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, VOLTAJE_REF, &ch);
 
-    // Configurar pines del sensor ULTRASÓNICO - NUEVO
+    // Configurar pines del sensor ULTRASÓNICO
     gpio_reset_pin(TRIG_PIN);
     gpio_reset_pin(ECHO_PIN);
     gpio_set_direction(TRIG_PIN, GPIO_MODE_OUTPUT);
@@ -968,7 +1065,7 @@ void app_main(void) {
         // ===== LEER SENSORES LOCALES =====
         valorNTU = leerTDS(&ch);
         valorPH = leerPH(&ch);
-        medirNivelAgua();  // NUEVO: Lectura del sensor ultrasónico
+        medirNivelAgua();
 
         // Log de TODAS las lecturas (locales + remotas)
         ESP_LOGI(TAG, "\n╔════════════════════════════════════╗");
@@ -981,9 +1078,9 @@ void app_main(void) {
         ESP_LOGI(TAG, "║   Voltaje TDS: %.2f V              ║", voltajeTDS);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
         ESP_LOGI(TAG, "║  ULTRASÓNICO LOCAL (Tinaco 1):     ║");
-        ESP_LOGI(TAG, "║   Distancia  : %.2f cm             ║", distanciaUltra);
+        ESP_LOGI(TAG, "║   Distancia  : %.2f cm            ║", distanciaUltra);
         ESP_LOGI(TAG, "║   Nivel Agua : %.2f cm             ║", nivelAgua);
-        ESP_LOGI(TAG, "║   Llenado    : %.1f%%              ║", llenadoTinaco);
+        ESP_LOGI(TAG, "║   Llenado    : %.1f%%               ║", llenadoTinaco);
         ESP_LOGI(TAG, "╠════════════════════════════════════╣");
         ESP_LOGI(TAG, "║     SENSORES REMOTOS - LLUVIA:     ║");
         ESP_LOGI(TAG, "║   Humedad 1  : %.1f%%              ║", datosLluvia.humedad1);
